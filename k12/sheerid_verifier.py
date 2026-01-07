@@ -70,6 +70,140 @@ class SheerIDVerifier:
             return match.group(1)
         return None
 
+    @staticmethod
+    def parse_email_token(url: str) -> Optional[str]:
+        """从 URL 中解析 emailToken"""
+        match = re.search(r'emailToken=(\d+)', url, re.IGNORECASE)
+        if match:
+            return match.group(1)
+        return None
+
+    def submit_email_token(self, email_token: str) -> Dict:
+        """提交 emailToken 完成 emailLoop 验证"""
+        body = {
+            "emailToken": email_token
+        }
+        data, status = self._sheerid_request(
+            'POST',
+            f"{SHEERID_BASE_URL}/rest/v2/verification/{self.verification_id}/step/emailLoop",
+            body
+        )
+        return data, status
+
+    def continue_with_token(self, email_token: str) -> Dict:
+        """使用 emailToken 继续验证流程（上传文档）"""
+        try:
+            logger.info(f"验证 ID: {self.verification_id}")
+            
+            # 首先检查当前验证状态
+            logger.info("检查验证状态...")
+            status_data, status_code = self._sheerid_request(
+                'GET',
+                f"{MY_SHEERID_URL}/rest/v2/verification/{self.verification_id}"
+            )
+            
+            current_step = status_data.get('currentStep', '') if isinstance(status_data, dict) else ''
+            logger.info(f"当前步骤: {current_step}")
+            
+            # 如果仍在 emailLoop 步骤，提交 token
+            if current_step == 'emailLoop':
+                logger.info(f"提交 emailToken: {email_token}")
+                token_data, token_status = self.submit_email_token(email_token)
+                
+                if token_status != 200:
+                    raise Exception(f"emailToken 提交失败 (状态码 {token_status}): {token_data}")
+                
+                if isinstance(token_data, dict) and token_data.get('currentStep') == 'error':
+                    error_msg = ', '.join(token_data.get('errorIds', ['Unknown error']))
+                    raise Exception(f"emailToken 错误: {error_msg}")
+                
+                current_step = token_data.get('currentStep', '') if isinstance(token_data, dict) else ''
+                logger.info(f"✓ emailToken 提交成功: {current_step}")
+            elif current_step == 'docUpload':
+                logger.info("✓ 已跳过 emailLoop，直接上传文档")
+            elif current_step == 'success':
+                return {
+                    'success': True,
+                    'pending': False,
+                    'message': '验证已完成',
+                    'verification_id': self.verification_id,
+                    'redirect_url': status_data.get('redirectUrl'),
+                    'status': status_data
+                }
+            elif current_step == 'error':
+                error_msg = ', '.join(status_data.get('errorIds', ['Unknown error']))
+                raise Exception(f"验证已失败: {error_msg}")
+            else:
+                logger.info(f"当前步骤为 {current_step}，尝试继续...")
+            
+            # 生成教师证明文档
+            logger.info("生成教师证明 PDF 和 PNG...")
+            from .name_generator import NameGenerator
+            from .img_generator import generate_teacher_pdf, generate_teacher_png
+            
+            name = NameGenerator.generate()
+            first_name = name['first_name']
+            last_name = name['last_name']
+            
+            pdf_data = generate_teacher_pdf(first_name, last_name)
+            png_data = generate_teacher_png(first_name, last_name)
+            pdf_size = len(pdf_data)
+            png_size = len(png_data)
+            logger.info(f"✓ PDF 大小: {pdf_size / 1024:.2f}KB, PNG 大小: {png_size / 1024:.2f}KB")
+            
+            # 请求上传 URL
+            logger.info("请求并上传文档...")
+            step4_body = {
+                'files': [
+                    {'fileName': 'teacher_document.pdf', 'mimeType': 'application/pdf', 'fileSize': pdf_size},
+                    {'fileName': 'teacher_document.png', 'mimeType': 'image/png', 'fileSize': png_size}
+                ]
+            }
+            
+            step4_data, step4_status = self._sheerid_request(
+                'POST',
+                f"{SHEERID_BASE_URL}/rest/v2/verification/{self.verification_id}/step/docUpload",
+                step4_body
+            )
+            
+            documents = step4_data.get('documents') or [] if isinstance(step4_data, dict) else []
+            if len(documents) < 2:
+                raise Exception(f"未能获取上传 URL: {step4_data}")
+            
+            pdf_upload_url = documents[0]['uploadUrl']
+            png_upload_url = documents[1]['uploadUrl']
+            logger.info("✓ 获取上传 URL 成功")
+            
+            if not self._upload_to_s3(pdf_upload_url, pdf_data, 'application/pdf'):
+                raise Exception("PDF 上传失败")
+            if not self._upload_to_s3(png_upload_url, png_data, 'image/png'):
+                raise Exception("PNG 上传失败")
+            logger.info("✓ 教师证明 PDF/PNG 上传成功")
+            
+            # 完成上传
+            step6_data, _ = self._sheerid_request(
+                'POST',
+                f"{SHEERID_BASE_URL}/rest/v2/verification/{self.verification_id}/step/completeDocUpload"
+            )
+            logger.info(f"✓ 文档提交完成: {step6_data.get('currentStep') if isinstance(step6_data, dict) else step6_data}")
+            
+            return {
+                'success': True,
+                'pending': True,
+                'message': '文档已提交，等待审核',
+                'verification_id': self.verification_id,
+                'redirect_url': step6_data.get('redirectUrl') if isinstance(step6_data, dict) else None,
+                'status': step6_data
+            }
+            
+        except Exception as e:
+            logger.error(f"✗ 继续验证失败: {e}")
+            return {
+                'success': False,
+                'message': str(e),
+                'verification_id': self.verification_id
+            }
+
     def _sheerid_request(self, method: str, url: str,
                          body: Optional[Dict] = None) -> Tuple[Dict, int]:
         """
@@ -203,6 +337,20 @@ class SheerIDVerifier:
                 )
                 logger.info(f"✓ 步骤 3 完成: {step3_data.get('currentStep')}")
                 current_step = step3_data.get('currentStep', current_step)
+
+            # 尝试跳过 emailLoop（如果需要）
+            if current_step == 'emailLoop':
+                logger.info("尝试跳过 emailLoop...")
+                skip_data, skip_status = self._sheerid_request(
+                    'DELETE',
+                    f"{SHEERID_BASE_URL}/rest/v2/verification/{self.verification_id}/step/emailLoop"
+                )
+                if skip_status == 200 and isinstance(skip_data, dict):
+                    current_step = skip_data.get('currentStep', current_step)
+                    logger.info(f"✓ emailLoop 跳过成功: {current_step}")
+                else:
+                    # 如果无法跳过，尝试直接上传文档
+                    logger.warning("无法跳过 emailLoop，尝试直接上传文档...")
 
             # 步骤 4: 上传文档并完成提交
             logger.info("步骤 4/4: 请求并上传文档...")

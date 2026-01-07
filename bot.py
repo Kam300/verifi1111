@@ -18,6 +18,7 @@ from handlers.user_commands import (
 from handlers.verify_commands import (
     verify_command,
     verify2_command,
+    verify2continue_command,
     verify3_command,
     verify4_command,
     getV4Code_command,
@@ -71,6 +72,7 @@ def main():
     # 注册验证命令
     application.add_handler(CommandHandler("verify", partial(verify_command, db=db)))
     application.add_handler(CommandHandler("verify2", partial(verify2_command, db=db)))
+    application.add_handler(CommandHandler("verify2continue", partial(verify2continue_command, db=db)))
     application.add_handler(CommandHandler("verify3", partial(verify3_command, db=db)))
     application.add_handler(CommandHandler("verify4", partial(verify4_command, db=db)))
     application.add_handler(CommandHandler("getV4Code", partial(getV4Code_command, db=db)))
