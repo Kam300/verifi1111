@@ -15,6 +15,7 @@ from k12.sheerid_verifier import SheerIDVerifier as K12Verifier
 from spotify.sheerid_verifier import SheerIDVerifier as SpotifyVerifier
 from youtube.sheerid_verifier import SheerIDVerifier as YouTubeVerifier
 from Boltnew.sheerid_verifier import SheerIDVerifier as BoltnewVerifier
+from perplexity.sheerid_verifier import SheerIDVerifier as PerplexityVerifier
 from utils.messages import get_insufficient_balance_message, get_verify_usage_message
 
 # 尝试导入并发控制，如果失败则使用空实现
@@ -229,7 +230,7 @@ async def verify3_command(update: Update, context: ContextTypes.DEFAULT_TYPE, db
 
     try:
         async with semaphore:
-        verifier = SpotifyVerifier(verification_id)
+            verifier = SpotifyVerifier(verification_id)
             result = await asyncio.to_thread(verifier.verify)
 
         db.add_verification(
@@ -616,4 +617,89 @@ async def getV4Code_command(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await processing_msg.edit_text(
             f"❌ 查询过程中出现错误：{str(e)}\n\n"
             "请稍后重试或联系管理员。"
+        )
+
+
+async def verify6_command(update: Update, context: ContextTypes.DEFAULT_TYPE, db: Database):
+    """处理 /verify6 命令 - Perplexity.ai Student"""
+    user_id = update.effective_user.id
+
+    if db.is_user_blocked(user_id):
+        await update.message.reply_text("您已被拉黑，无法使用此功能。")
+        return
+
+    if not db.user_exists(user_id):
+        await update.message.reply_text("请先使用 /start 注册。")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            get_verify_usage_message("/verify6", "Perplexity.ai Student")
+        )
+        return
+
+    url = context.args[0]
+    user = db.get_user(user_id)
+    if user["balance"] < VERIFY_COST:
+        await update.message.reply_text(
+            get_insufficient_balance_message(user["balance"])
+        )
+        return
+
+    # 解析 verificationId 或 externalUserId
+    verification_id = PerplexityVerifier.parse_verification_id(url)
+    external_user_id = PerplexityVerifier.parse_external_user_id(url)
+    
+    if not verification_id and not external_user_id:
+        await update.message.reply_text("无效的 SheerID 链接，请检查后重试。")
+        return
+
+    if not db.deduct_balance(user_id, VERIFY_COST):
+        await update.message.reply_text("扣除积分失败，请稍后重试。")
+        return
+
+    processing_msg = await update.message.reply_text(
+        f"🔍 开始处理 Perplexity.ai Student 认证...\n"
+        f"已扣除 {VERIFY_COST} 积分\n\n"
+        "📝 正在生成学生信息...\n"
+        "🎨 正在生成学生证 PNG...\n"
+        "📤 正在提交文档..."
+    )
+
+    # 使用信号量控制并发
+    semaphore = get_verification_semaphore("perplexity_student")
+
+    try:
+        async with semaphore:
+            verifier = PerplexityVerifier(url, verification_id=verification_id)
+            result = await asyncio.to_thread(verifier.verify)
+
+        db.add_verification(
+            user_id,
+            "perplexity_student",
+            url,
+            "success" if result["success"] else "failed",
+            str(result),
+        )
+
+        if result["success"]:
+            result_msg = "✅ Perplexity.ai 学生认证成功！\n\n"
+            if result.get("pending"):
+                result_msg += "✨ 文档已提交，等待 SheerID 审核\n"
+                result_msg += "⏱️ 预计审核时间：几分钟内\n\n"
+            if result.get("redirect_url"):
+                result_msg += f"🔗 跳转链接：\n{result['redirect_url']}"
+            await processing_msg.edit_text(result_msg)
+        else:
+            db.add_balance(user_id, VERIFY_COST)
+            await processing_msg.edit_text(
+                f"❌ 认证失败：{result.get('message', '未知错误')}\n\n"
+                f"已退回 {VERIFY_COST} 积分"
+            )
+    except Exception as e:
+        logger.error("Perplexity 验证过程出错: %s", e)
+        db.add_balance(user_id, VERIFY_COST)
+        await processing_msg.edit_text(
+            f"❌ 处理过程中出现错误：{str(e)}\n\n"
+            f"已退回 {VERIFY_COST} 积分"
         )
